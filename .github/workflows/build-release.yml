@@ -1,0 +1,106 @@
+name: Build and Release 21Lab
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '21Lab-Classic-Source.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build Player, Studio and installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Extract 21Lab source archive
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:GITHUB_WORKSPACE '21Lab-Classic-Source.zip'
+          if (!(Test-Path $archive)) { throw '21Lab-Classic-Source.zip is missing from the repository root.' }
+          $sourceDir = Join-Path $env:RUNNER_TEMP '21Lab-source'
+          Expand-Archive -LiteralPath $archive -DestinationPath $sourceDir -Force
+          $project = Join-Path $sourceDir '21Lab-Classic'
+          if (!(Test-Path (Join-Path $project 'package.json'))) { throw 'The source archive has an unexpected structure.' }
+          "PROJECT_DIR=$project" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Node dependencies
+        shell: pwsh
+        run: |
+          Set-Location $env:PROJECT_DIR
+          npm install --no-audit --no-fund
+
+      - name: Build 21Lab Player
+        shell: pwsh
+        run: |
+          Set-Location $env:PROJECT_DIR
+          npm run build:player
+
+      - name: Build 21Lab Studio
+        shell: pwsh
+        run: |
+          Set-Location $env:PROJECT_DIR
+          npm run build:studio
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
+          $iscc = Join-Path $programFilesX86 'Inno Setup 6\ISCC.exe'
+          if (!(Test-Path $iscc)) { throw "Inno Setup compiler not found at $iscc" }
+          "ISCC_PATH=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Package one-click installer
+        shell: pwsh
+        run: |
+          Set-Location $env:PROJECT_DIR
+          & $env:ISCC_PATH 'installer\21Lab.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+
+      - name: Collect and verify outputs
+        shell: pwsh
+        run: |
+          $project = $env:PROJECT_DIR
+          $out = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $files = @(
+            @{ From = (Join-Path $project 'release\player\21Lab.exe'); To = '21Lab.exe' },
+            @{ From = (Join-Path $project 'release\studio\21Lab Studio.exe'); To = '21Lab Studio.exe' },
+            @{ From = (Join-Path $project 'release\installer\21Lab-Setup.exe'); To = '21Lab-Setup.exe' },
+            @{ From = (Join-Path $env:GITHUB_WORKSPACE '21Lab-Classic-Source.zip'); To = '21Lab-Classic-Source.zip' }
+          )
+          foreach ($file in $files) {
+            if (!(Test-Path $file.From)) { throw "Expected build output not found: $($file.From)" }
+            Copy-Item -LiteralPath $file.From -Destination (Join-Path $out $file.To) -Force
+          }
+          Get-ChildItem $out | Select-Object Name, Length
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 21Lab-Windows-${{ github.run_number }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: 21lab-build-${{ github.run_number }}
+          name: 21Lab Classic build ${{ github.run_number }}
+          prerelease: true
+          make_latest: false
+          files: artifacts/*
+          fail_on_unmatched_files: true
